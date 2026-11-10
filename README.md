@@ -99,7 +99,7 @@ TrueVerdict/
 
 TrueVerdict is free and takes zero affiliate kickbacks. If this tool saved you from buying a broken product, consider supporting development:
 
-[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-$3-orange.svg?style=for-the-badge&logo=buy-me-a-coffee)](https://buymeacoffee.com/trueverdict)
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-$3-orange.svg?style=for-the-badge&logo=buy-me-a-coffee)](https://buymeacoffee.com/himanshutiwari)
 
 ---
 

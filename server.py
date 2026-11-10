@@ -16,6 +16,7 @@ from src.models import ProductInfo, Review, VerdictResult  # noqa: E402
 class ExtensionProduct(BaseModel):
     """Product shape produced by extractPageData() in the extension."""
     title: str
+    brand: str = ""
     claimedRating: float = 0.0
     totalReviews: int = 0
     platform: str = "generic"
@@ -63,6 +64,7 @@ def analyze(req: AnalyzeRequest):
     p = req.product
     product = ProductInfo(
         title=p.title,
+        brand=p.brand or None,
         url=p.url,
         platform=p.platform,
         claimed_rating=p.claimedRating,

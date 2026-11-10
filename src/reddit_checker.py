@@ -132,7 +132,8 @@ class RedditChecker:
     def _build_prompt(product: ProductInfo, clean_title: str) -> str:
         return (
             f"Product listing on {product.platform}: \"{product.title}\"\n"
-            f"Core product name: \"{clean_title}\"\n\n"
+            f"Core product name: \"{clean_title}\"\n"
+            f"Brand: {product.brand or 'unknown'}\n\n"
             "Summarize what long-term owners on Reddit and enthusiast communities say about THIS product: "
             "durability, recurring defects, and whether it is worth the money.\n\n"
             "Rules:\n"
