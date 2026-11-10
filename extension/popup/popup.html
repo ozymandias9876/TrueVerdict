@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TrueVerdict</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Header -->
+    <header class="header">
+      <div class="logo-group">
+        <div class="logo-shield">✓</div>
+        <div>
+          <h1 class="logo-title">TrueVerdict</h1>
+          <span class="logo-subtitle">The Honest Review & Durability Reality</span>
+        </div>
+      </div>
+      <div class="privacy-badge">🔒 100% Private</div>
+    </header>
+
+    <!-- Loading State -->
+    <div id="loading-view" class="view-state">
+      <div class="spinner"></div>
+      <p class="loading-text">Scanning page reviews & analyzing durability...</p>
+    </div>
+
+    <!-- Empty State -->
+    <div id="empty-view" class="view-state hidden">
+      <div class="empty-icon">🔍</div>
+      <h3 id="empty-title">No Product Detected</h3>
+      <p class="empty-desc">Open an Amazon, Walmart, Target, or Shopify product page with customer reviews to analyze.</p>
+      <button id="rescan-btn" class="primary-btn" style="margin-bottom: 8px;">Rescan Active Tab</button>
+      <button id="load-demo-btn" class="secondary-btn" style="background:#1e293b; color:#94a3b8; border:1px solid #334155; font-size:12px; padding:8px 12px; border-radius:6px; cursor:pointer; width:100%;">Test with Sample Product (Sony XM5)</button>
+    </div>
+
+    <!-- Main Results View -->
+    <div id="results-view" class="view-state hidden">
+      
+      <!-- Product Header & Verdict Banner -->
+      <div class="card product-card">
+        <h2 id="product-title" class="product-title">Loading product...</h2>
+        <div class="ratings-comparison">
+          <div class="rating-box claimed-box">
+            <span class="rating-label">Claimed Rating</span>
+            <span id="claimed-rating" class="rating-value">4.8★</span>
+            <span id="reviews-count" class="rating-meta">1,200 reviews</span>
+          </div>
+
+          <div class="rating-arrow">➔</div>
+
+          <div class="rating-box true-box">
+            <span class="rating-label">True Rating</span>
+            <span id="true-rating" class="rating-value">3.1★</span>
+            <span id="verdict-badge" class="verdict-pill badge-red">DO NOT BUY</span>
+          </div>
+        </div>
+        <p id="headline-text" class="verdict-headline"></p>
+      </div>
+
+      <!-- Feature 1: Authenticity & Fake Detection -->
+      <div class="card auth-card">
+        <div class="card-header">
+          <span class="card-title">🛡️ Review Authenticity</span>
+          <span id="auth-grade" class="grade-badge grade-d">Grade D</span>
+        </div>
+        <div class="auth-meter-container">
+          <div class="auth-bar-bg">
+            <div id="auth-bar-fill" class="auth-bar-fill" style="width: 52%;"></div>
+          </div>
+          <div class="auth-meta-row">
+            <span id="auth-score-text">52% Authentic</span>
+            <span id="unverified-stat">48% Manipulated / Unverified</span>
+          </div>
+        </div>
+        <ul id="flagged-reasons-list" class="reasons-list">
+          <!-- Filled dynamically -->
+        </ul>
+      </div>
+
+      <!-- Feature 2: Durability & The 6-Month Reality -->
+      <div class="card durability-card">
+        <div class="card-header">
+          <span class="card-title">⏳ The "6-Month Reality"</span>
+          <span id="durability-score-badge" class="durability-pill">50 / 100 Durability</span>
+        </div>
+        
+        <p id="durability-verdict-text" class="durability-verdict">High Risk of Failure Within 90 Days</p>
+
+        <!-- Visual Timeline Breakdown -->
+        <div class="timeline-container">
+          <span class="timeline-title">When Products Break (Reported Failures):</span>
+          <div class="timeline-bars">
+            <div class="timeline-col">
+              <span class="timeline-val" id="tf-0-30">0</span>
+              <div class="timeline-bar-vertical bar-amber" style="height: 15%;"></div>
+              <span class="timeline-label">0-30d</span>
+            </div>
+            <div class="timeline-col active-failure-col">
+              <span class="timeline-val" id="tf-1-3">2</span>
+              <div class="timeline-bar-vertical bar-red" style="height: 85%;"></div>
+              <span class="timeline-label">1-3 mo</span>
+            </div>
+            <div class="timeline-col">
+              <span class="timeline-val" id="tf-3-6">0</span>
+              <div class="timeline-bar-vertical bar-slate" style="height: 10%;"></div>
+              <span class="timeline-label">3-6 mo</span>
+            </div>
+            <div class="timeline-col">
+              <span class="timeline-val" id="tf-6-12">0</span>
+              <div class="timeline-bar-vertical bar-slate" style="height: 10%;"></div>
+              <span class="timeline-label">6-12 mo</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Fatal Flaws -->
+        <div class="fatal-flaws-section">
+          <span class="section-subtitle">⚠️ Recurring Hardware / Component Flaws:</span>
+          <div id="fatal-flaws-list" class="flaws-pill-container">
+            <!-- Dynamic pills -->
+          </div>
+        </div>
+      </div>
+
+      <!-- Feature 3: Reddit Community Consensus -->
+      <div class="card reddit-card">
+        <div class="card-header">
+          <span class="card-title">💬 Reddit Consensus</span>
+          <span id="reddit-sentiment-badge" class="reddit-pill">Mixed / Flawed</span>
+        </div>
+        <p id="reddit-summary" class="reddit-summary-text"></p>
+        <div id="reddit-quote-box" class="reddit-quote-box">
+          <p id="reddit-quote-text" class="reddit-quote-text"></p>
+          <span id="reddit-quote-source" class="reddit-quote-source"></span>
+        </div>
+      </div>
+
+      <!-- Buy Me a Coffee Support Footer -->
+      <footer class="footer-card">
+        <p class="footer-mission">
+          <strong>TrueVerdict is 100% Free & Independent.</strong> We take zero affiliate kickbacks from Amazon or brands. If this tool saved you from a broken purchase, buy a coffee to support development!
+        </p>
+        <a href="https://buymeacoffee.com/trueverdict" target="_blank" rel="noopener noreferrer" class="coffee-btn">
+          ☕ Buy Me a Coffee ($3)
+        </a>
+      </footer>
+
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
