@@ -88,6 +88,28 @@
         }
       }
 
+      // Extract Brand from Amazon byline or specs
+      const byline = document.querySelector('#bylineInfo, #bylineInfo_feature_div, .po-brand .po-break-word, a#bylineInfo');
+      if (byline) {
+        const raw = byline.textContent.trim();
+        const m = raw.match(/(?:Brand:\s*|Visit the\s*)([A-Za-z0-9\s&-]+?)(?:\s*Store|$)/i);
+        if (m && m[1].trim().length > 1) {
+          product.brand = m[1].trim();
+        }
+      }
+      if (!product.brand) {
+        const brandRow = document.querySelector('tr.po-brand td.po-break-word');
+        if (brandRow && brandRow.textContent.trim()) {
+          product.brand = brandRow.textContent.trim();
+        }
+      }
+      if (!product.brand && product.title) {
+        const firstWord = product.title.replace(/^(?:pack of \d+|set of \d+)\s*/i, '').split(/\s+/)[0].replace(/[^a-zA-Z0-9]/g, '');
+        if (firstWord.length > 2) {
+          product.brand = firstWord;
+        }
+      }
+
       // Claimed Rating
       const starEl = document.querySelector('#acrPopover span.a-icon-alt, #acrPopover, [data-hook="rating-out-of-text"]');
       if (starEl) {
