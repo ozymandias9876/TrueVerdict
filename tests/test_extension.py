@@ -26,9 +26,18 @@ class TestChromeExtension(unittest.TestCase):
             # In Chrome, extension pages can be loaded directly from file or chrome-extension://
             page = context.new_page()
 
-            # Listen to console errors
+            # Force the offline rule-engine path regardless of whether server.py is running
+            api_prefix = "http://127.0.0.1:8787"
+            page.route(f"{api_prefix}/**", lambda route: route.abort())
+
+            # Listen to console errors (the aborted API request is expected)
             console_errors = []
-            page.on("console", lambda msg: console_errors.append(msg.text) if msg.type == "error" else None)
+            page.on(
+                "console",
+                lambda msg: console_errors.append(msg.text)
+                if msg.type == "error" and not msg.location.get("url", "").startswith(api_prefix)
+                else None,
+            )
 
             # Directly load popup.html via file URL
             popup_path = os.path.join(ext_path, "popup", "popup.html")

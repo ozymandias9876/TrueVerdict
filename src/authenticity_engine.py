@@ -178,7 +178,7 @@ class AuthenticityEngine:
         grade = self._score_to_grade(final_score)
 
         # 6. Calculate True Adjusted Rating
-        adjusted_rating = self._calculate_adjusted_rating(reviews, suspicious_reviews)
+        adjusted_rating = self._calculate_adjusted_rating(reviews, suspicious_reviews, product.claimed_rating)
 
         return AuthenticityReport(
             score=final_score,
@@ -220,14 +220,26 @@ class AuthenticityEngine:
 
         return False, ""
 
-    def _calculate_adjusted_rating(self, all_reviews: List[Review], suspicious_reviews: List[Review]) -> float:
+    def _calculate_adjusted_rating(self, all_reviews: List[Review], suspicious_reviews: List[Review], claimed_rating: float = 0.0) -> float:
         """
         Re-weights reviews to strip out artificial inflation:
-        - Suspicious reviews: 0.15 weight
-        - Unverified 5-star reviews: 0.3 weight
+        - Suspicious reviews: 0.2 weight
+        - Unverified 4+ star reviews: 0.35 weight
         - Incentivized reviews: 0.5 weight
-        - Verified, detailed organic reviews: 1.0 weight
+        - Verified, detailed organic reviews: 1.0 weight (1.25 if > 40 words)
+
+        The scraped sample is small and skewed (marketplaces surface top reviews), so when the
+        platform's claimed rating is known it is the baseline; only the inflation the re-weighting
+        detects in the sample is subtracted from it, and the result never exceeds the claim.
         """
+        weighted = self._weighted_rating(all_reviews, suspicious_reviews)
+        if claimed_rating <= 0 or not all_reviews:
+            return weighted
+        sample_avg = sum(r.rating for r in all_reviews) / len(all_reviews)
+        inflation = max(0.0, sample_avg - weighted)
+        return max(1.0, claimed_rating - inflation)
+
+    def _weighted_rating(self, all_reviews: List[Review], suspicious_reviews: List[Review]) -> float:
         suspicious_ids = {r.id for r in suspicious_reviews}
         weighted_sum = 0.0
         total_weight = 0.0

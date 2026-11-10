@@ -48,10 +48,10 @@ class TrueVerdictEngine:
         reddit_consensus = self.reddit_checker.get_consensus(product)
 
         # 4. Synthesize Final Verdict
-        final_verdict, badge_color = self._determine_final_verdict(auth_report, durability_report, reddit_consensus)
+        final_verdict, badge_color, reasons = self._determine_final_verdict(auth_report, durability_report, reddit_consensus)
 
         # 5. Headline & Key Takeaways
-        headline, takeaways = self._generate_verdict_narrative(product, auth_report, durability_report, reddit_consensus, final_verdict)
+        headline, takeaways = self._generate_verdict_narrative(product, auth_report, durability_report, reddit_consensus, final_verdict, reasons)
 
         fatal_warning = None
         if durability_report.fatal_flaws and len(durability_report.fatal_flaws) > 0:
@@ -76,18 +76,36 @@ class TrueVerdictEngine:
         auth: AuthenticityReport,
         durability: DurabilityReport,
         reddit: RedditConsensus
-    ) -> tuple[str, str]:
-        """Calculates BUY / CAUTION / DO NOT BUY with color code."""
-        # Fatal conditions for "DO NOT BUY"
-        if auth.grade in ["D", "F"] or durability.durability_score < 45 or "Avoid" in reddit.sentiment or "Do Not Buy" in reddit.sentiment:
-            return "DO NOT BUY", "red"
+    ) -> tuple[str, str, List[str]]:
+        """Calculates BUY / CAUTION / DO NOT BUY with color code and the reasons that triggered it."""
+        # Reddit only counts when there is actual evidence; "no discussions found" is neutral
+        reddit_reliable = reddit.found_discussions and reddit.confidence != "Low"
+        reddit_negative = reddit_reliable and ("Avoid" in reddit.sentiment or "Do Not Buy" in reddit.sentiment)
+        reddit_mixed = reddit_reliable and "Mixed" in reddit.sentiment
 
-        # Caution conditions
-        if auth.grade == "C" or durability.durability_score < 75 or "Mixed" in reddit.sentiment or auth.unverified_ratio > 0.25:
-            return "PROCEED WITH CAUTION", "yellow"
+        severe = []
+        if auth.grade in ["D", "F"]:
+            severe.append(f"heavy review manipulation (Grade {auth.grade} authenticity)")
+        if durability.durability_score < 45:
+            severe.append(f"frequent early breakdowns ({durability.durability_score}/100 durability)")
+        if reddit_negative:
+            severe.append("owners on Reddit widely report serious problems")
+        if severe:
+            return "DO NOT BUY", "red", severe
 
-        # Otherwise Recommended
-        return "RECOMMENDED", "green"
+        caution = []
+        if auth.grade == "C":
+            caution.append("some reviews look manipulated (Grade C authenticity)")
+        if auth.unverified_ratio > 0.25:
+            caution.append(f"{round(auth.unverified_ratio * 100)}% of sampled reviews are unverified")
+        if durability.durability_score < 75:
+            caution.append(f"recurring component wear ({durability.durability_score}/100 durability)")
+        if reddit_mixed:
+            caution.append("mixed long-term owner sentiment on Reddit")
+        if caution:
+            return "PROCEED WITH CAUTION", "yellow", caution
+
+        return "RECOMMENDED", "green", []
 
     def _generate_verdict_narrative(
         self,
@@ -95,7 +113,8 @@ class TrueVerdictEngine:
         auth: AuthenticityReport,
         durability: DurabilityReport,
         reddit: RedditConsensus,
-        verdict: str
+        verdict: str,
+        reasons: List[str]
     ) -> tuple[str, List[str]]:
         takeaways = []
 
@@ -115,12 +134,12 @@ class TrueVerdictEngine:
         if reddit.consensus_summary:
             takeaways.append(f"Reddit Consensus: {reddit.consensus_summary}")
 
-        # Headline
+        reason_text = "; ".join(reasons)
         if verdict == "DO NOT BUY":
-            headline = f"Buyer Beware: Heavy review distortion and elevated early breakdown risk ({auth.grade} Authenticity, {durability.durability_score}/100 Durability)."
+            headline = f"Buyer Beware: {reason_text[:1].upper()}{reason_text[1:]}."
         elif verdict == "PROCEED WITH CAUTION":
-            headline = f"Mixed Reliability: Product functions initially, but watch for specific component wear ({auth.grade} Authenticity)."
+            headline = f"Proceed with Caution: {reason_text[:1].upper()}{reason_text[1:]}."
         else:
-            headline = f"Verified Legitimate: Genuine reviews confirm solid performance and trustworthy build quality."
+            headline = f"Looks Legitimate: Grade {auth.grade} authenticity and {durability.durability_score}/100 durability in the sampled reviews."
 
         return headline, takeaways

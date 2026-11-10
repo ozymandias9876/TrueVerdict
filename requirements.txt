@@ -1,0 +1,10 @@
+pydantic>=2
+beautifulsoup4
+google-genai
+fastapi
+uvicorn
+python-dotenv
+playwright
+pillow
+pytest
+httpx
