@@ -1,7 +1,21 @@
+import logging
 import re
 from typing import List, Dict, Optional, Tuple
 from collections import defaultdict
+
+from google.genai import types
+from pydantic import BaseModel
+
+from src.config import GEMINI_MODEL
 from src.models import Review, DurabilityReport, TemporalFailurePoint, ProductInfo
+
+logger = logging.getLogger(__name__)
+
+NO_FLAWS_MESSAGE = "No recurring fatal flaws detected in available review corpus."
+
+
+class _GeminiFlaws(BaseModel):
+    flaws: List[str]
 
 
 class DurabilityEngine:
@@ -227,26 +241,20 @@ class DurabilityEngine:
     def _summarize_fatal_flaws(self, failures: List[TemporalFailurePoint], component_counter: Dict[str, int], product: ProductInfo) -> List[str]:
         """Synthesizes top fatal flaws."""
         flaws = []
-        # If we have Gemini available, we can ask for a synthesized 3-bullet summary
         if self.gemini_client and failures:
             try:
-                sample_quotes = "\n".join([f"- ({f.timeframe}, {f.component}): \"{f.quote}\"" for f in failures[:8]])
-                prompt = (
-                    f"Product: {product.title}\n"
-                    f"Here are user failure reports after prolonged use:\n{sample_quotes}\n\n"
-                    "Extract exactly 2 to 3 concise, highly-specific bullet points detailing when and how this product breaks or fails (e.g. 'Battery degradation: Loses charge within 60-90 days'). "
-                    "Output ONLY the bullet points, no preamble."
-                )
                 response = self.gemini_client.models.generate_content(
-                    model="gemini-3.1-flash-lite",
-                    contents=prompt
+                    model=GEMINI_MODEL,
+                    contents=self._build_flaws_prompt(failures, product),
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=_GeminiFlaws,
+                        temperature=0.1,
+                    ),
                 )
-                if response and response.text:
-                    lines = [line.strip().lstrip("-*• ") for line in response.text.strip().split("\n") if line.strip()]
-                    if lines:
-                        return lines[:3]
-            except Exception:
-                pass
+                return _GeminiFlaws.model_validate_json(response.text).flaws[:3] or [NO_FLAWS_MESSAGE]
+            except Exception as e:
+                logger.warning("Gemini flaw summary failed for %r: %s", product.title, e)
 
         # Algorithmic rule-based fallback
         for comp, count in sorted(component_counter.items(), key=lambda x: x[1], reverse=True)[:3]:
@@ -257,6 +265,27 @@ class DurabilityEngine:
             flaws.append(f"{comp}: {count} buyers report breakdown after {tf_str} ('{matching[0].quote[:80]}...')")
 
         if not flaws:
-            flaws = ["No recurring fatal flaws detected in available review corpus."]
+            flaws = [NO_FLAWS_MESSAGE]
 
         return flaws
+
+    @staticmethod
+    def _build_flaws_prompt(failures: List[TemporalFailurePoint], product: ProductInfo) -> str:
+        reports = "\n".join(
+            f"{i}. [{f.review_rating:.0f}★, {f.timeframe}, keyword-matched as {f.component}] \"{f.quote}\""
+            for i, f in enumerate(failures[:12], 1)
+        )
+        return (
+            f"Product: {product.title}\n\n"
+            f"A keyword filter flagged these {len(failures)} customer review excerpts as possible failure reports "
+            "(timeframe and component labels are automatic guesses and may be wrong):\n"
+            f"{reports}\n\n"
+            "Return up to 3 recurring product defects actually described in these excerpts.\n"
+            "Rules:\n"
+            "- Use only the excerpts above. Do not add defects, numbers, or timeframes that are not stated in them.\n"
+            "- Discard excerpts that do not describe a real defect or failure of the product itself "
+            "(praise, delivery or seller issues, price complaints, subjective preferences).\n"
+            "- Each item: '<Component>: <what goes wrong>, <when, only if an excerpt states it> (<k> of "
+            f"{len(failures)} reports)'.\n"
+            "- If no excerpt describes a real defect, return an empty list."
+        )

@@ -1,6 +1,7 @@
 /**
  * TrueVerdict Extension - Popup Controller & Client-Side Engine
- * 100% Client-Side, Zero External Tracking, Zero Login Required
+ * Sends scraped reviews to the local TrueVerdict API (server.py, Gemini-backed) when it is running;
+ * otherwise falls back to the in-browser rule engine below.
  * Intelligent Dynamic Analysis: Review Syndicate Detection, Real Durability Anchors, Honest Reddit Handling
  */
 
@@ -263,6 +264,361 @@ const GENUINE_REDDIT_KNOWLEDGE = {
   }
 };
 
+const API_URL = "http://127.0.0.1:8787/analyze";
+const API_TIMEOUT_MS = 45000;
+
+// Detect category to customize flaw analysis
+function detectCategory(title) {
+  const t = title.toLowerCase();
+  if (/phone\s*case|back\s*case|cover\b|silicone\s*case|bumper|sleeve\b|screen\s*protector/i.test(t)) {
+    return "phone_case";
+  }
+  if (/\b(?:kurtas?|sarees?|dress(?:es)?|t-shirts?|shirts?|pants?|jeans|cloth(?:ing)?|dupattas?|shoes|fabric|apparel|salwar|tops?|jackets?)\b/i.test(t)) {
+    return "apparel";
+  }
+  if (/phone|charger|earbud|headphone|cable|power bank|laptop|bluetooth|speaker|camera|screen/i.test(t)) {
+    return "electronics";
+  }
+  if (/blender|pan|skillet|pot|cooker|knife|kitchen|vacuum|air fryer|grill/i.test(t)) {
+    return "kitchen";
+  }
+  return "general";
+}
+
+function flawsSubtitleFor(category) {
+  if (category === "apparel") return "⚠️ Recurring Fit & Fabric Complaints:";
+  if (category === "phone_case") return "⚠️ Recurring Case & Material Flaws:";
+  return "⚠️ Recurring Hardware & Durability Flaws:";
+}
+
+// Detect duplicate 6+ word sentences shared across reviews (Review Farming signature)
+function detectDuplicateReviewSyndicate(reviews) {
+  const phraseMap = {};
+  let duplicatePhrases = [];
+
+  reviews.forEach((r, idx) => {
+    const text = `${r.title} ${r.body}`.toLowerCase();
+    const words = text.match(/[a-z]{3,}/g) || [];
+    for (let i = 0; i <= words.length - 6; i++) {
+      const shingle = words.slice(i, i + 6).join(" ");
+      if (!phraseMap[shingle]) {
+        phraseMap[shingle] = new Set();
+      }
+      phraseMap[shingle].add(idx);
+    }
+  });
+
+  for (const [phrase, idxs] of Object.entries(phraseMap)) {
+    if (idxs.size > 1) {
+      duplicatePhrases.push({ phrase, count: idxs.size });
+    }
+  }
+
+  return duplicatePhrases;
+}
+
+async function fetchServerVerdict(product, reviews) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  try {
+    const resp = await fetch(API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ product, reviews }),
+      signal: controller.signal
+    });
+    if (!resp.ok) throw new Error(`TrueVerdict API ${resp.status}`);
+    return await resp.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+const VERDICT_BADGE_CLASS = { green: "badge-green", yellow: "badge-yellow", red: "badge-red" };
+
+// Maps the Python engine's VerdictResult onto the popup view model
+function viewFromServer(result, product, reviews) {
+  const auth = result.authenticity;
+  const dur = result.durability;
+  const reddit = result.reddit;
+  const tl = dur.timeline_breakdown || {};
+  const quote = reddit.top_quotes && reddit.top_quotes[0];
+  const claimed = product.claimedRating || result.product.claimed_rating;
+
+  return {
+    engine: result.engine,
+    title: product.title,
+    claimed: Math.round(claimed * 10) / 10,
+    reviewsCount: product.totalReviews || reviews.length,
+    trueRating: result.adjusted_star_rating,
+    verdict: result.final_verdict,
+    badgeClass: VERDICT_BADGE_CLASS[result.verdict_badge_color] || "badge-yellow",
+    headline: result.headline,
+    authGrade: auth.grade,
+    authScore: auth.score,
+    unverifiedText: `${Math.round(auth.unverified_ratio * 100)}% Unverified`,
+    flaggedReasons: auth.flagged_reasons.length ? auth.flagged_reasons : ["Reviews appear organic with natural linguistic variety."],
+    durabilityScore: dur.durability_score,
+    durabilityVerdict: dur.durability_verdict,
+    timeline: {
+      "0-30": tl["0-30 days"] || 0,
+      "1-3": tl["1-3 months"] || 0,
+      "3-6": tl["3-6 months"] || 0,
+      "6-12": tl["6-12 months"] || 0
+    },
+    flaws: dur.fatal_flaws.length ? dur.fatal_flaws : ["No recurring fatal flaws detected in available review corpus."],
+    flawsSubtitle: flawsSubtitleFor(detectCategory(product.title)),
+    reddit: {
+      badge: reddit.sentiment,
+      summary: reddit.consensus_summary,
+      quote: quote ? quote.quote : null,
+      source: quote ? quote.subreddit : null
+    }
+  };
+}
+
+// Rule-based analysis used when the TrueVerdict API is unreachable
+function analyzeLocally(product, reviews) {
+  const category = detectCategory(product.title);
+  const reviewCount = reviews.length;
+
+  // 1. Authenticity Analysis
+  let aiHits = 0;
+  let unverifiedHits = 0;
+  let flaggedReasons = [];
+
+  reviews.forEach(r => {
+    const text = `${r.title || ""} ${r.body || ""}`;
+    let hit = AI_MARKERS.some(m => m.test(text));
+    if (hit) aiHits++;
+    if (!r.verified) unverifiedHits++;
+  });
+
+  // Check review farming / recycled duplicate sentences
+  const duplicateSyndicates = detectDuplicateReviewSyndicate(reviews);
+  let reviewFarmingDetected = duplicateSyndicates.length >= 3;
+
+  const aiRatio = reviewCount > 0 ? (aiHits / reviewCount) : 0;
+  const unverifiedRatio = reviewCount > 0 ? (unverifiedHits / reviewCount) : 0;
+
+  let authScore = 100;
+  if (reviewFarmingDetected) {
+    authScore -= 45;
+    const sample = duplicateSyndicates[0].phrase;
+    flaggedReasons.push(`⚠️ Review Syndicate Detected: Multiple reviews share verbatim identical copy-pasted sentences ("...${sample}...").`);
+  }
+
+  if (aiRatio > 0.15) {
+    authScore -= 20;
+    flaggedReasons.push(`${Math.round(aiRatio * 100)}% reviews show formulaic AI / promotional patterns.`);
+  }
+
+  if (unverifiedRatio > 0.3) {
+    authScore -= 20;
+    flaggedReasons.push(`${Math.round(unverifiedRatio * 100)}% reviews are from unverified purchases.`);
+  }
+
+  let authGrade = "A";
+  if (authScore < 60) authGrade = "D";
+  else if (authScore < 75) authGrade = "C";
+  else if (authScore < 88) authGrade = "B";
+
+  if (reviewCount === 0) {
+    authGrade = "B";
+    authScore = 80;
+    flaggedReasons.push("Rating-only distribution: No detailed written reviews published yet for this variant.");
+  } else if (flaggedReasons.length === 0) {
+    flaggedReasons.push("Reviews appear organic with natural linguistic variety.");
+  }
+
+  // Adjusted Rating calculation
+  let claimed = product.claimedRating || (reviewCount > 0 ? (reviews.reduce((acc, r) => acc + r.rating, 0) / reviewCount) : 4.0);
+  claimed = Math.round(claimed * 10) / 10;
+  let adjustedRating = claimed;
+  if (reviewFarmingDetected) {
+    adjustedRating = Math.max(2.1, claimed - 1.2);
+  } else if (authScore < 70) {
+    adjustedRating = Math.max(1.8, claimed - 1.0);
+  } else if (authScore < 85) {
+    adjustedRating = Math.max(2.5, claimed - 0.4);
+  }
+  adjustedRating = Math.round(adjustedRating * 10) / 10;
+
+  // 2. Durability Analysis ("The 6-Month Reality")
+  const timeline = { "0-30": 0, "1-3": 0, "3-6": 0, "6-12": 0 };
+  const detectedFlaws = [];
+  let earlyFailures = 0;
+
+  reviews.forEach(r => {
+    const text = `${r.title || ""} ${r.body || ""}`.trim();
+    if (!text) return;
+
+    let isCritical = r.rating <= 3.5 || /broke|died|stopped|fail|tear|shrink|bleed|faded|small|wash|dust|lint|scratch|button|fit|loose/i.test(text);
+
+    // Check strictly for real temporal anchors
+    let matchedTf = null;
+    if (/(?:after|within|around)\s+(?:2|3|two|three)\s+months|60\s*days|90\s*days/i.test(text)) {
+      matchedTf = "1-3";
+    } else if (/(?:after|within)\s+(?:6|six)\s+months|180\s*days/i.test(text)) {
+      matchedTf = "3-6";
+    } else if (/(?:after|within)\s+(?:1|one|a)\s+month|30\s*days|20\s*days|week\s*[1-3]|few\s*days|first\s*wash|1\s*wash/i.test(text)) {
+      matchedTf = "0-30";
+    }
+
+    if (matchedTf) {
+      timeline[matchedTf] = (timeline[matchedTf] || 0) + 1;
+      if (matchedTf === "0-30" || matchedTf === "1-3") earlyFailures++;
+    }
+
+    // Dynamic Flaw Extraction directly from actual user complaints
+    if (isCritical) {
+      // Phone Case domain flaws
+      if (category === "phone_case") {
+        if (/dust|dirt|scratch|peeling|fingerprint|lint|smudge/i.test(text)) {
+          if (!detectedFlaws.some(f => f.includes("Surface Finish"))) {
+            detectedFlaws.push(`Surface Finish: Silicone attracts pocket lint & dust easily`);
+          }
+        }
+        if (/button|responsive|stiff|click|press/i.test(text)) {
+          if (!detectedFlaws.some(f => f.includes("Button Tactility"))) {
+            detectedFlaws.push(`Button Tactility: Stiff button feedback reported by users`);
+          }
+        }
+        if (/fit|loose|corner|cutout|camera\s*lip/i.test(text)) {
+          if (!detectedFlaws.some(f => f.includes("Precision Fit"))) {
+            detectedFlaws.push(`Precision Fit: Cutout or edge alignment variance`);
+          }
+        }
+        if (/yellow|discolor|stain|fade/i.test(text)) {
+          if (!detectedFlaws.some(f => f.includes("Discoloration"))) {
+            detectedFlaws.push(`Material Aging: Material prone to discoloration over time`);
+          }
+        }
+      }
+      // Apparel domain flaws
+      else if (category === "apparel") {
+        if (/size|sizing|small|tight|fitting|plus size/i.test(text)) {
+          const quote = r.body.length > 70 ? r.body.slice(0, 70) + "..." : r.body;
+          if (!detectedFlaws.some(f => f.includes("Fit & Sizing"))) {
+            detectedFlaws.push(`Fit & Sizing: Buyers warn sizes run small ("${quote}")`);
+          }
+        }
+        if (/polyester|rayon|cotton|transparent|cloth|fabric|quality/i.test(text) && r.rating <= 3.5) {
+          const quote = r.body.length > 70 ? r.body.slice(0, 70) + "..." : r.body;
+          if (!detectedFlaws.some(f => f.includes("Material Quality"))) {
+            detectedFlaws.push(`Material Quality: Mixed fabric feedback ("${quote}")`);
+          }
+        }
+        if (/wash|faded|bleed|shrink/i.test(text)) {
+          if (!detectedFlaws.some(f => f.includes("Wash Durability"))) {
+            detectedFlaws.push(`Wash Durability: Monitor color bleeding / shrinkage after washing`);
+          }
+        }
+      }
+      // Electronics domain flaws
+      else if (category === "electronics") {
+        if (/hinge|swivel|arm|snap|crack/i.test(text)) {
+          if (!detectedFlaws.some(f => f.includes("Structural Hinge"))) {
+            detectedFlaws.push(`Structural Hinge: Wear & cracking reported in regular commute`);
+          }
+        }
+        if (/battery|charge|charging|port/i.test(text)) {
+          if (!detectedFlaws.some(f => f.includes("Battery & Power"))) {
+            detectedFlaws.push(`Battery & Power: Charging degradation reported`);
+          }
+        }
+        if (/dust|dirt|scratch|peeling|fingerprint/i.test(text)) {
+          if (!detectedFlaws.some(f => f.includes("Surface Finish"))) {
+            detectedFlaws.push(`Surface Finish: Attracts lint and scratches easily`);
+          }
+        }
+      }
+      // General flaws
+      else {
+        if (r.rating <= 3.0 && detectedFlaws.length < 2) {
+          const shortQuote = r.body.length > 80 ? r.body.slice(0, 80) + "..." : r.body;
+          detectedFlaws.push(`Critical User Report: "${shortQuote}"`);
+        }
+      }
+    }
+  });
+
+  let durabilityScore = Math.max(35, 100 - (earlyFailures * 18));
+  let durabilityVerdict = "Solid Durability (Low Failure Rate)";
+  if (reviewCount === 0) {
+    durabilityScore = 75;
+    durabilityVerdict = "Insufficient written review history to flag specific hardware wear";
+    detectedFlaws.push("No written complaints registered yet for this variant.");
+  } else if (earlyFailures >= 2) {
+    durabilityVerdict = "High Risk of Failure Within 90 Days";
+  } else if (earlyFailures === 1 || detectedFlaws.length >= 2) {
+    durabilityVerdict = "Moderate Durability (Monitor Key Flaws)";
+  }
+
+  if (detectedFlaws.length === 0) {
+    detectedFlaws.push("No recurring durability or material breakdown reported in current review set.");
+  }
+
+  // 3. Reddit Community Consensus (Honest Matching - NO Fake Quotes)
+  const titleLower = product.title.toLowerCase();
+  let redditMatch = null;
+  for (const [k, v] of Object.entries(GENUINE_REDDIT_KNOWLEDGE)) {
+    if (titleLower.includes(k)) {
+      redditMatch = v;
+      break;
+    }
+  }
+
+  const reddit = redditMatch
+    ? { badge: redditMatch.sentiment, summary: redditMatch.summary, quote: redditMatch.quote, source: redditMatch.subreddit }
+    : {
+        badge: "Unlisted Brand",
+        summary: `No organic Reddit discussions found for "${product.title.slice(0, 35)}...". Standard for marketplace smartphone accessories and unlisted direct brands.`,
+        quote: null,
+        source: null
+      };
+
+  // 4. Final Verdict Badge & Dynamic Headline
+  let finalVerdict = "RECOMMENDED";
+  let badgeClass = "badge-green";
+  let headline = "Verified Legitimate: Genuine reviews confirm solid performance and trustworthy build quality.";
+
+  if (reviewFarmingDetected || authGrade === "D" || authGrade === "F" || (redditMatch && redditMatch.sentiment.includes("Do Not Buy"))) {
+    finalVerdict = "DO NOT BUY";
+    badgeClass = "badge-red";
+    headline = "Severe Risk: Fabricated reviews and recurring structural complaints make this a high-regret purchase.";
+  } else if (authGrade === "C" || adjustedRating < 3.2 || earlyFailures >= 2) {
+    finalVerdict = "DO NOT BUY";
+    badgeClass = "badge-red";
+    headline = "High Failure Rate: Review analysis indicates uncharacteristic degradation within the first 90 days.";
+  } else if (authGrade === "B" || adjustedRating < 4.1 || earlyFailures === 1) {
+    finalVerdict = "PROCEED WITH CAUTION";
+    badgeClass = "badge-yellow";
+    headline = `Mixed Reliability: Product functions well initially, but watch for specific component wear (${authGrade} Authenticity).`;
+  }
+
+  return {
+    engine: "local-rules",
+    title: product.title,
+    claimed,
+    reviewsCount: product.totalReviews || reviewCount,
+    trueRating: adjustedRating,
+    verdict: finalVerdict,
+    badgeClass,
+    headline,
+    authGrade,
+    authScore,
+    unverifiedText: `${100 - authScore}% Unverified`,
+    flaggedReasons,
+    durabilityScore,
+    durabilityVerdict,
+    timeline,
+    flaws: detectedFlaws,
+    flawsSubtitle: flawsSubtitleFor(category),
+    reddit
+  };
+}
+
 document.addEventListener("DOMContentLoaded", async () => {
   const loadingView = document.getElementById("loading-view");
   const emptyView = document.getElementById("empty-view");
@@ -298,7 +654,23 @@ document.addEventListener("DOMContentLoaded", async () => {
       { rating: 5, body: "Best office headset for calls, voice isolation works well in noisy cafes.", verified: true, dateStr: "2026-02-11" }
     ];
 
-    renderAnalysis(sampleProduct, sampleReviews);
+    analyzeAndRender(sampleProduct, sampleReviews);
+  }
+
+  async function analyzeAndRender(product, reviews) {
+    loadingView.classList.remove("hidden");
+    emptyView.classList.add("hidden");
+    resultsView.classList.add("hidden");
+
+    let view;
+    try {
+      const result = await fetchServerVerdict(product, reviews);
+      view = viewFromServer(result, product, reviews);
+    } catch (err) {
+      console.warn("TrueVerdict API unavailable, using local rules:", err);
+      view = analyzeLocally(product, reviews);
+    }
+    renderVerdict(view);
   }
 
   async function performScan() {
@@ -340,8 +712,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         return;
       }
 
-      // Always render the detected product! Never fail or show demo data.
-      renderAnalysis(bestData.product, bestData.reviews || []);
+      await analyzeAndRender(bestData.product, bestData.reviews || []);
 
     } catch (err) {
       console.error("TrueVerdict extraction error:", err);
@@ -359,337 +730,78 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
   }
 
-  // Detect category to customize flaw analysis
-  function detectCategory(title) {
-    const t = title.toLowerCase();
-    if (/phone\s*case|back\s*case|cover\b|silicone\s*case|bumper|sleeve\b|screen\s*protector/i.test(t)) {
-      return "phone_case";
-    }
-    if (/kurta|saree|dress|shirt|pant|jeans|cloth|dupatta|shoes|fabric|apparel|salwar|t-shirt|top\b/i.test(t)) {
-      return "apparel";
-    }
-    if (/phone|charger|earbud|headphone|cable|power bank|laptop|bluetooth|speaker|camera|screen/i.test(t)) {
-      return "electronics";
-    }
-    if (/blender|pan|skillet|pot|cooker|knife|kitchen|vacuum|air fryer|grill/i.test(t)) {
-      return "kitchen";
-    }
-    return "general";
-  }
-
-  // Detect duplicate 6+ word sentences shared across reviews (Review Farming signature)
-  function detectDuplicateReviewSyndicate(reviews) {
-    const phraseMap = {};
-    let duplicatePhrases = [];
-
-    reviews.forEach((r, idx) => {
-      const text = `${r.title} ${r.body}`.toLowerCase();
-      const words = text.match(/[a-z]{3,}/g) || [];
-      for (let i = 0; i <= words.length - 6; i++) {
-        const shingle = words.slice(i, i + 6).join(" ");
-        if (!phraseMap[shingle]) {
-          phraseMap[shingle] = new Set();
-        }
-        phraseMap[shingle].add(idx);
-      }
-    });
-
-    for (const [phrase, idxs] of Object.entries(phraseMap)) {
-      if (idxs.size > 1) {
-        duplicatePhrases.push({ phrase, count: idxs.size });
-      }
-    }
-
-    return duplicatePhrases;
-  }
-
-  function renderAnalysis(product, reviews) {
+  function renderVerdict(view) {
     loadingView.classList.add("hidden");
     emptyView.classList.add("hidden");
     resultsView.classList.remove("hidden");
 
-    const category = detectCategory(product.title);
-    const reviewCount = reviews.length;
-
-    // 1. Authenticity Analysis
-    let aiHits = 0;
-    let unverifiedHits = 0;
-    let flaggedReasons = [];
-
-    reviews.forEach(r => {
-      const text = `${r.title || ""} ${r.body || ""}`;
-      let hit = AI_MARKERS.some(m => m.test(text));
-      if (hit) aiHits++;
-      if (!r.verified) unverifiedHits++;
-    });
-
-    // Check review farming / recycled duplicate sentences
-    const duplicateSyndicates = detectDuplicateReviewSyndicate(reviews);
-    let reviewFarmingDetected = duplicateSyndicates.length >= 3;
-
-    const aiRatio = reviewCount > 0 ? (aiHits / reviewCount) : 0;
-    const unverifiedRatio = reviewCount > 0 ? (unverifiedHits / reviewCount) : 0;
-
-    let authScore = 100;
-    if (reviewFarmingDetected) {
-      authScore -= 45;
-      const sample = duplicateSyndicates[0].phrase;
-      flaggedReasons.push(`⚠️ Review Syndicate Detected: Multiple reviews share verbatim identical copy-pasted sentences ("...${sample}...").`);
+    const engineBadge = document.querySelector(".privacy-badge");
+    if (engineBadge) {
+      engineBadge.textContent = view.engine === "local-rules" ? "🔒 Local rules" : `⚡ ${view.engine.replace(/^gemini:/, "")}`;
+      engineBadge.title = view.engine === "local-rules"
+        ? "TrueVerdict API not reachable; analyzed in-browser"
+        : "Analyzed by local TrueVerdict API (review text sent to Gemini)";
     }
 
-    if (aiRatio > 0.15) {
-      authScore -= 20;
-      flaggedReasons.push(`${Math.round(aiRatio * 100)}% reviews show formulaic AI / promotional patterns.`);
-    }
-
-    if (unverifiedRatio > 0.3) {
-      authScore -= 20;
-      flaggedReasons.push(`${Math.round(unverifiedRatio * 100)}% reviews are from unverified purchases.`);
-    }
-
-    let authGrade = "A";
-    let gradeClass = "grade-a";
-    if (authScore < 60) { authGrade = "D"; gradeClass = "grade-d"; }
-    else if (authScore < 75) { authGrade = "C"; gradeClass = "grade-c"; }
-    else if (authScore < 88) { authGrade = "B"; gradeClass = "grade-b"; }
-
-    if (reviewCount === 0) {
-      authGrade = "B";
-      gradeClass = "grade-b";
-      authScore = 80;
-      flaggedReasons.push("Rating-only distribution: No detailed written reviews published yet for this variant.");
-    } else if (flaggedReasons.length === 0) {
-      flaggedReasons.push("Reviews appear organic with natural linguistic variety.");
-    }
-
-    // Adjusted Rating calculation
-    let claimed = product.claimedRating || (reviewCount > 0 ? (reviews.reduce((acc, r) => acc + r.rating, 0) / reviewCount) : 4.0);
-    claimed = Math.round(claimed * 10) / 10;
-    let adjustedRating = claimed;
-    if (reviewFarmingDetected) {
-      adjustedRating = Math.max(2.1, claimed - 1.2);
-    } else if (authScore < 70) {
-      adjustedRating = Math.max(1.8, claimed - 1.0);
-    } else if (authScore < 85) {
-      adjustedRating = Math.max(2.5, claimed - 0.4);
-    }
-    adjustedRating = Math.round(adjustedRating * 10) / 10;
-
-    // 2. Durability Analysis ("The 6-Month Reality")
-    const timeline = { "0-30": 0, "1-3": 0, "3-6": 0, "6-12": 0 };
-    const detectedFlaws = [];
-    let earlyFailures = 0;
-
-    reviews.forEach(r => {
-      const text = `${r.title || ""} ${r.body || ""}`.trim();
-      if (!text) return;
-
-      let isCritical = r.rating <= 3.5 || /broke|died|stopped|fail|tear|shrink|bleed|faded|small|wash|dust|lint|scratch|button|fit|loose/i.test(text);
-
-      // Check strictly for real temporal anchors
-      let matchedTf = null;
-      if (/(?:after|within|around)\s+(?:2|3|two|three)\s+months|60\s*days|90\s*days/i.test(text)) {
-        matchedTf = "1-3";
-      } else if (/(?:after|within)\s+(?:6|six)\s+months|180\s*days/i.test(text)) {
-        matchedTf = "3-6";
-      } else if (/(?:after|within)\s+(?:1|one|a)\s+month|30\s*days|20\s*days|week\s*[1-3]|few\s*days|first\s*wash|1\s*wash/i.test(text)) {
-        matchedTf = "0-30";
-      }
-
-      if (matchedTf) {
-        timeline[matchedTf] = (timeline[matchedTf] || 0) + 1;
-        if (matchedTf === "0-30" || matchedTf === "1-3") earlyFailures++;
-      }
-
-      // Dynamic Flaw Extraction directly from actual user complaints
-      if (isCritical) {
-        // Phone Case domain flaws
-        if (category === "phone_case") {
-          if (/dust|dirt|scratch|peeling|fingerprint|lint|smudge/i.test(text)) {
-            if (!detectedFlaws.some(f => f.includes("Surface Finish"))) {
-              detectedFlaws.push(`Surface Finish: Silicone attracts pocket lint & dust easily`);
-            }
-          }
-          if (/button|responsive|stiff|click|press/i.test(text)) {
-            if (!detectedFlaws.some(f => f.includes("Button Tactility"))) {
-              detectedFlaws.push(`Button Tactility: Stiff button feedback reported by users`);
-            }
-          }
-          if (/fit|loose|corner|cutout|camera\s*lip/i.test(text)) {
-            if (!detectedFlaws.some(f => f.includes("Precision Fit"))) {
-              detectedFlaws.push(`Precision Fit: Cutout or edge alignment variance`);
-            }
-          }
-          if (/yellow|discolor|stain|fade/i.test(text)) {
-            if (!detectedFlaws.some(f => f.includes("Discoloration"))) {
-              detectedFlaws.push(`Material Aging: Material prone to discoloration over time`);
-            }
-          }
-        }
-        // Apparel domain flaws
-        else if (category === "apparel") {
-          if (/size|sizing|small|tight|fitting|plus size/i.test(text)) {
-            const quote = r.body.length > 70 ? r.body.slice(0, 70) + "..." : r.body;
-            if (!detectedFlaws.some(f => f.includes("Fit & Sizing"))) {
-              detectedFlaws.push(`Fit & Sizing: Buyers warn sizes run small ("${quote}")`);
-            }
-          }
-          if (/polyester|rayon|cotton|transparent|cloth|fabric|quality/i.test(text) && r.rating <= 3.5) {
-            const quote = r.body.length > 70 ? r.body.slice(0, 70) + "..." : r.body;
-            if (!detectedFlaws.some(f => f.includes("Material Quality"))) {
-              detectedFlaws.push(`Material Quality: Mixed fabric feedback ("${quote}")`);
-            }
-          }
-          if (/wash|faded|bleed|shrink/i.test(text)) {
-            if (!detectedFlaws.some(f => f.includes("Wash Durability"))) {
-              detectedFlaws.push(`Wash Durability: Monitor color bleeding / shrinkage after washing`);
-            }
-          }
-        }
-        // Electronics domain flaws
-        else if (category === "electronics") {
-          if (/hinge|swivel|arm|snap|crack/i.test(text)) {
-            if (!detectedFlaws.some(f => f.includes("Structural Hinge"))) {
-              detectedFlaws.push(`Structural Hinge: Wear & cracking reported in regular commute`);
-            }
-          }
-          if (/battery|charge|charging|port/i.test(text)) {
-            if (!detectedFlaws.some(f => f.includes("Battery & Power"))) {
-              detectedFlaws.push(`Battery & Power: Charging degradation reported`);
-            }
-          }
-          if (/dust|dirt|scratch|peeling|fingerprint/i.test(text)) {
-            if (!detectedFlaws.some(f => f.includes("Surface Finish"))) {
-              detectedFlaws.push(`Surface Finish: Attracts lint and scratches easily`);
-            }
-          }
-        }
-        // General flaws
-        else {
-          if (r.rating <= 3.0 && detectedFlaws.length < 2) {
-            const shortQuote = r.body.length > 80 ? r.body.slice(0, 80) + "..." : r.body;
-            detectedFlaws.push(`Critical User Report: "${shortQuote}"`);
-          }
-        }
-      }
-    });
-
-    let durabilityScore = Math.max(35, 100 - (earlyFailures * 18));
-    let durabilityVerdict = "Solid Durability (Low Failure Rate)";
-    if (reviewCount === 0) {
-      durabilityScore = 75;
-      durabilityVerdict = "Insufficient written review history to flag specific hardware wear";
-      detectedFlaws.push("No written complaints registered yet for this variant.");
-    } else if (earlyFailures >= 2) {
-      durabilityVerdict = "High Risk of Failure Within 90 Days";
-    } else if (earlyFailures === 1 || detectedFlaws.length >= 2) {
-      durabilityVerdict = "Moderate Durability (Monitor Key Flaws)";
-    }
-
-    if (detectedFlaws.length === 0) {
-      detectedFlaws.push("No recurring durability or material breakdown reported in current review set.");
-    }
-
-    // 3. Reddit Community Consensus (Honest Matching - NO Fake Quotes)
-    const titleLower = product.title.toLowerCase();
-    let redditMatch = null;
-    for (const [k, v] of Object.entries(GENUINE_REDDIT_KNOWLEDGE)) {
-      if (titleLower.includes(k)) {
-        redditMatch = v;
-        break;
-      }
-    }
-
-    const redditBadgeEl = document.getElementById("reddit-sentiment-badge");
-    const redditQuoteBox = document.getElementById("reddit-quote-box");
-
-    if (redditMatch) {
-      redditBadgeEl.textContent = redditMatch.sentiment;
-      redditBadgeEl.className = "reddit-pill";
-      document.getElementById("reddit-summary").textContent = redditMatch.summary;
-      document.getElementById("reddit-quote-text").textContent = `"${redditMatch.quote}"`;
-      document.getElementById("reddit-quote-source").textContent = `— Discussion on ${redditMatch.subreddit}`;
-      redditQuoteBox.classList.remove("hidden");
-    } else {
-      // HONEST UNLISTED BRAND HANDLING
-      redditBadgeEl.textContent = "Unlisted Brand";
-      redditBadgeEl.style.background = "#475569";
-      document.getElementById("reddit-summary").textContent = `No organic Reddit discussions found for "${product.title.slice(0, 35)}...". Standard for marketplace smartphone accessories and unlisted direct brands.`;
-      redditQuoteBox.classList.add("hidden"); // Never fabricate a quote!
-    }
-
-    // 4. Final Verdict Badge & Dynamic Headline
-    let finalVerdict = "RECOMMENDED";
-    let badgeClass = "badge-green";
-    let headline = "Verified Legitimate: Genuine reviews confirm solid performance and trustworthy build quality.";
-
-    if (reviewFarmingDetected || authGrade === "D" || authGrade === "F" || (redditMatch && redditMatch.sentiment.includes("Do Not Buy"))) {
-      finalVerdict = "DO NOT BUY";
-      badgeClass = "badge-red";
-      headline = "Severe Risk: Fabricated reviews and recurring structural complaints make this a high-regret purchase.";
-    } else if (authGrade === "C" || adjustedRating < 3.2 || earlyFailures >= 2) {
-      finalVerdict = "DO NOT BUY";
-      badgeClass = "badge-red";
-      headline = "High Failure Rate: Review analysis indicates uncharacteristic degradation within the first 90 days.";
-    } else if (authGrade === "B" || adjustedRating < 4.1 || earlyFailures === 1) {
-      finalVerdict = "PROCEED WITH CAUTION";
-      badgeClass = "badge-amber";
-      headline = `Mixed Reliability: Product functions well initially, but watch for specific component wear (${authGrade} Authenticity).`;
-    }
-
-    // Populate UI elements
-    document.getElementById("product-title").textContent = product.title;
-    document.getElementById("claimed-rating").textContent = `${claimed}★`;
-    document.getElementById("reviews-count").textContent = `${(product.totalReviews || reviewCount).toLocaleString()} reviews`;
-    document.getElementById("true-rating").textContent = `${adjustedRating}★`;
+    document.getElementById("product-title").textContent = view.title;
+    document.getElementById("claimed-rating").textContent = `${view.claimed}★`;
+    document.getElementById("reviews-count").textContent = `${view.reviewsCount.toLocaleString()} reviews`;
+    document.getElementById("true-rating").textContent = `${view.trueRating}★`;
 
     const verdictBadge = document.getElementById("verdict-badge");
-    verdictBadge.textContent = finalVerdict;
-    verdictBadge.className = `verdict-pill ${badgeClass}`;
-    document.getElementById("headline-text").textContent = headline;
+    verdictBadge.textContent = view.verdict;
+    verdictBadge.className = `verdict-pill ${view.badgeClass}`;
+    document.getElementById("headline-text").textContent = view.headline;
 
     const authGradeEl = document.getElementById("auth-grade");
-    authGradeEl.textContent = `Grade ${authGrade}`;
-    authGradeEl.className = `grade-badge ${gradeClass}`;
+    authGradeEl.textContent = `Grade ${view.authGrade}`;
+    authGradeEl.className = `grade-badge grade-${view.authGrade.toLowerCase()}`;
 
-    document.getElementById("auth-bar-fill").style.width = `${authScore}%`;
-    document.getElementById("auth-score-text").textContent = `${authScore}% Authentic`;
-    document.getElementById("unverified-stat").textContent = `${100 - authScore}% Unverified`;
+    document.getElementById("auth-bar-fill").style.width = `${view.authScore}%`;
+    document.getElementById("auth-score-text").textContent = `${view.authScore}% Authentic`;
+    document.getElementById("unverified-stat").textContent = view.unverifiedText;
 
     const reasonsListEl = document.getElementById("flagged-reasons-list");
     reasonsListEl.innerHTML = "";
-    flaggedReasons.forEach(reason => {
+    view.flaggedReasons.forEach(reason => {
       const li = document.createElement("li");
       li.textContent = reason;
       reasonsListEl.appendChild(li);
     });
 
-    document.getElementById("durability-score-badge").textContent = `${durabilityScore} / 100 Durability`;
-    document.getElementById("durability-verdict-text").textContent = durabilityVerdict;
+    document.getElementById("durability-score-badge").textContent = `${view.durabilityScore} / 100 Durability`;
+    document.getElementById("durability-verdict-text").textContent = view.durabilityVerdict;
 
-    // Timeline bars
-    document.getElementById("tf-0-30").textContent = timeline["0-30"];
-    document.getElementById("tf-1-3").textContent = timeline["1-3"];
-    document.getElementById("tf-3-6").textContent = timeline["3-6"];
+    document.getElementById("tf-0-30").textContent = view.timeline["0-30"];
+    document.getElementById("tf-1-3").textContent = view.timeline["1-3"];
+    document.getElementById("tf-3-6").textContent = view.timeline["3-6"];
+    document.getElementById("tf-6-12").textContent = view.timeline["6-12"];
 
-    // Flaws section subtitle
     const flawsSubtitle = document.querySelector(".fatal-flaws-section .section-subtitle");
-    if (flawsSubtitle) {
-      flawsSubtitle.textContent = category === "apparel"
-        ? "⚠️ Recurring Fit & Fabric Complaints:"
-        : category === "phone_case"
-        ? "⚠️ Recurring Case & Material Flaws:"
-        : "⚠️ Recurring Hardware & Durability Flaws:";
-    }
+    if (flawsSubtitle) flawsSubtitle.textContent = view.flawsSubtitle;
 
     const flawsListEl = document.getElementById("fatal-flaws-list");
     flawsListEl.innerHTML = "";
-    detectedFlaws.forEach(flaw => {
+    view.flaws.forEach(flaw => {
       const div = document.createElement("div");
       div.className = "flaw-pill";
       div.textContent = flaw;
       flawsListEl.appendChild(div);
     });
+
+    const redditBadgeEl = document.getElementById("reddit-sentiment-badge");
+    const redditQuoteBox = document.getElementById("reddit-quote-box");
+    redditBadgeEl.textContent = view.reddit.badge;
+    redditBadgeEl.className = "reddit-pill";
+    redditBadgeEl.style.background = ["Unlisted Brand", "Insufficient Data"].includes(view.reddit.badge) ? "#475569" : "";
+    document.getElementById("reddit-summary").textContent = view.reddit.summary;
+    if (view.reddit.quote) {
+      document.getElementById("reddit-quote-text").textContent = `"${view.reddit.quote}"`;
+      document.getElementById("reddit-quote-source").textContent = `— Discussion on ${view.reddit.source}`;
+      redditQuoteBox.classList.remove("hidden");
+    } else {
+      redditQuoteBox.classList.add("hidden");
+    }
   }
 
   // Trigger initial scan

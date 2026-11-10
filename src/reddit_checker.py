@@ -1,7 +1,22 @@
-import json
+import logging
 import re
-from typing import List, Optional
+from typing import List, Literal
+
+from google.genai import types
+from pydantic import BaseModel
+
+from src.config import GEMINI_MODEL
 from src.models import RedditConsensus, RedditQuote, ProductInfo
+
+logger = logging.getLogger(__name__)
+
+
+class _GeminiRedditVerdict(BaseModel):
+    found_discussions: bool
+    sentiment: Literal["Strongly Recommended", "Mixed / Proceed with Caution", "Do Not Buy", "Insufficient Data"]
+    confidence: Literal["High", "Moderate", "Low"]
+    subreddits_checked: List[str]
+    consensus_summary: str
 
 
 class RedditChecker:
@@ -76,70 +91,63 @@ class RedditChecker:
         # 2. Query Gemini intelligence if available and not matched above
         if self.gemini_client:
             try:
-                prompt = (
-                    f"Product to research: \"{clean_title}\"\n\n"
-                    "Analyze the organic discussions, sentiment, and durability complaints across Reddit "
-                    "(e.g., r/BuyItForLife, r/gadgets, r/frugal, r/technology, or product-specific communities).\n"
-                    "Provide your evaluation in valid JSON with these exact keys:\n"
-                    "{\n"
-                    "  \"found_discussions\": true,\n"
-                    "  \"sentiment\": \"Strongly Recommended\" | \"Mixed / Proceed with Caution\" | \"Do Not Buy\",\n"
-                    "  \"confidence\": \"High\" | \"Moderate\" | \"Low\",\n"
-                    "  \"subreddits_checked\": [\"r/...\", \"r/...\"],\n"
-                    "  \"consensus_summary\": \"Concise 2-sentence summary of real human sentiment, long-term durability, and whether it is worth the money.\",\n"
-                    "  \"top_quotes\": [\n"
-                    "    {\"quote\": \"Actual representative user viewpoint or quote\", \"subreddit\": \"r/...\", \"score\": 120}\n"
-                    "  ]\n"
-                    "}\n"
-                    "Return ONLY the JSON object. Do not include markdown codeblocks or other text."
-                )
-
                 resp = self.gemini_client.models.generate_content(
-                    model="gemini-3.1-flash-lite",
-                    contents=prompt
+                    model=GEMINI_MODEL,
+                    contents=self._build_prompt(product, clean_title),
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=_GeminiRedditVerdict,
+                        temperature=0.2,
+                    ),
                 )
-                if resp and resp.text:
-                    raw_text = resp.text.strip()
-                    raw_text = re.sub(r"^```json\s*", "", raw_text)
-                    raw_text = re.sub(r"^```\s*", "", raw_text)
-                    raw_text = re.sub(r"\s*```$", "", raw_text)
-
-                    data = json.loads(raw_text)
-                    quotes = [
-                        RedditQuote(
-                            quote=q.get("quote", ""),
-                            subreddit=q.get("subreddit", "r/reddit"),
-                            score=q.get("score", 0),
-                            url=""
-                        )
-                        for q in data.get("top_quotes", [])
-                    ]
-
-                    return RedditConsensus(
-                        found_discussions=data.get("found_discussions", True),
-                        sentiment=data.get("sentiment", "Mixed"),
-                        confidence=data.get("confidence", "Moderate"),
-                        subreddits_checked=data.get("subreddits_checked", ["r/BuyItForLife"]),
-                        consensus_summary=data.get("consensus_summary", ""),
-                        top_quotes=quotes
+                data = _GeminiRedditVerdict.model_validate_json(resp.text)
+                if not data.found_discussions:
+                    data.sentiment = "Insufficient Data"
+                    data.confidence = "Low"
+                    data.subreddits_checked = []
+                    data.consensus_summary = (
+                        f"No established Reddit owner discussions found for '{clean_title}'. "
+                        "This is common for new or marketplace-only products and is not a negative signal."
                     )
-            except Exception:
-                pass
 
-        # 3. Intelligent heuristic fallback
-        return RedditConsensus(
-            found_discussions=True,
-            sentiment="Mixed / Proceed with Caution",
-            confidence="Moderate",
-            subreddits_checked=["r/ConsumerReports", "r/BuyItForLife"],
-            consensus_summary=f"Reddit discussions for '{clean_title}' show moderate satisfaction with warnings regarding component longevity after 3 months.",
-            top_quotes=[
-                RedditQuote(
-                    quote=f"Good functionality initially, but build quality is inconsistent under daily stress.",
-                    subreddit="r/BuyItForLife",
-                    score=64
+                # Gemini has no live Reddit access here, so it never supplies verbatim quotes
+                return RedditConsensus(
+                    found_discussions=data.found_discussions,
+                    sentiment=data.sentiment,
+                    confidence=data.confidence,
+                    subreddits_checked=data.subreddits_checked,
+                    consensus_summary=data.consensus_summary,
                 )
-            ]
+            except Exception as e:
+                logger.warning("Gemini Reddit consensus failed for %r: %s", clean_title, e)
+
+        return RedditConsensus(
+            found_discussions=False,
+            sentiment="Insufficient Data",
+            confidence="Low",
+            consensus_summary=f"No community consensus available for '{clean_title}'.",
+        )
+
+    @staticmethod
+    def _build_prompt(product: ProductInfo, clean_title: str) -> str:
+        return (
+            f"Product listing on {product.platform}: \"{product.title}\"\n"
+            f"Core product name: \"{clean_title}\"\n\n"
+            "Summarize what long-term owners on Reddit and enthusiast communities say about THIS product: "
+            "durability, recurring defects, and whether it is worth the money.\n\n"
+            "Rules:\n"
+            "- You cannot browse the web. Answer only from knowledge you are confident about. "
+            "Never invent threads, quotes, usernames, upvote counts, or statistics.\n"
+            "- If you have no reliable knowledge of owner discussions about this exact product "
+            "(for example it is new, obscure, white-label, or released after your training data), set "
+            "found_discussions=false, sentiment=\"Insufficient Data\", confidence=\"Low\". "
+            "A lack of information is NOT evidence that the product is bad.\n"
+            "- If your knowledge is about a predecessor or sibling model rather than this exact product, "
+            "name that model in the summary and use confidence \"Moderate\" or lower.\n"
+            "- Use \"Do Not Buy\" only when owners widely report serious defects, safety hazards, or misrepresentation "
+            "for this product line. Use \"Strongly Recommended\" only for broad, durable owner satisfaction.\n"
+            "- subreddits_checked: only communities where this product line is genuinely discussed; empty if none.\n"
+            "- consensus_summary: at most 2 factual sentences, no marketing language."
         )
 
     def _clean_product_title(self, title: str) -> str:
